@@ -1,0 +1,5 @@
+{
+  "terminal.integrated.cwd": "${workspaceFolder}/medicate",
+  "dart.flutterSdkPath": null,
+  "dart.projectSearchDepth": 3
+}
