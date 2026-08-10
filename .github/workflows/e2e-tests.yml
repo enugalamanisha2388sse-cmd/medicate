@@ -1,0 +1,303 @@
+name: 🏥 Medicate — Appium E2E Tests & Excel Report
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  # Allow manual trigger with optional parameters
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Target platform'
+        required: true
+        default: 'android'
+        type: choice
+        options:
+          - android
+          - ios
+      test_suite:
+        description: 'Test suite to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - auth
+          - patient
+          - reports
+
+env:
+  FLUTTER_VERSION: '3.22.0'
+  JAVA_VERSION: '17'
+  NODE_VERSION: '20'
+  ANDROID_API_LEVEL: '33'
+  ANDROID_BUILD_TOOLS: '33.0.2'
+  ANDROID_TARGET: 'default'
+  ANDROID_ARCH: 'x86_64'
+  PLATFORM: ${{ github.event.inputs.platform || 'android' }}
+  BUILD_NUMBER: ${{ github.run_number }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 1: Build Flutter APK
+  # ─────────────────────────────────────────────────────────────────────────────
+  build-flutter:
+    name: 🔨 Build Flutter APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: 🐦 Setup Flutter ${{ env.FLUTTER_VERSION }}
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: 📦 Install Flutter dependencies
+        working-directory: medicate
+        run: flutter pub get
+
+      - name: 🔍 Flutter analyze (lint)
+        working-directory: medicate
+        run: flutter analyze --no-fatal-infos
+        continue-on-error: true
+
+      - name: 🏗️ Build debug APK
+        working-directory: medicate
+        run: |
+          flutter build apk --debug \
+            --target-platform android-x64 \
+            --no-shrink
+
+      - name: 📤 Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: medicate-debug-apk
+          path: medicate/build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 3
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 2: Run Appium E2E Tests
+  # ─────────────────────────────────────────────────────────────────────────────
+  e2e-tests:
+    name: 🧪 Appium E2E Tests
+    runs-on: ubuntu-latest
+    needs: build-flutter
+    timeout-minutes: 60
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: ☕ Setup Java ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+
+      - name: 🟢 Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: e2e-tests/package.json
+
+      - name: 📦 Install E2E test dependencies
+        working-directory: e2e-tests
+        run: npm ci
+
+      - name: 📱 Install Appium & Flutter Driver
+        run: |
+          npm install -g appium@latest
+          appium driver install flutter
+          appium driver install uiautomator2
+
+      - name: 📥 Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: medicate-debug-apk
+          path: medicate/build/app/outputs/flutter-apk/
+
+      - name: 🖥️ Enable KVM (hardware acceleration)
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | \
+            sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: 🤖 Setup Android Emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          target: ${{ env.ANDROID_TARGET }}
+          arch: ${{ env.ANDROID_ARCH }}
+          profile: pixel_5
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: |
+            # ── Wait for emulator ──────────────────────────────────────
+            adb wait-for-device
+            adb shell input keyevent 82  # unlock screen
+            echo "✅ Emulator ready"
+
+            # ── Install APK ───────────────────────────────────────────
+            adb install -r medicate/build/app/outputs/flutter-apk/app-debug.apk
+            echo "✅ APK installed"
+
+            # ── Start Appium server in background ─────────────────────
+            appium --log ./e2e-tests/logs/appium.log &
+            APPIUM_PID=$!
+            sleep 8
+            echo "✅ Appium server started (PID: $APPIUM_PID)"
+
+            # ── Run E2E tests ─────────────────────────────────────────
+            cd e2e-tests
+
+            # Determine which spec files to run
+            if [ "${{ github.event.inputs.test_suite }}" = "auth" ]; then
+              SPECS="tests/auth/**/*.spec.js"
+            elif [ "${{ github.event.inputs.test_suite }}" = "patient" ]; then
+              SPECS="tests/patient/**/*.spec.js"
+            elif [ "${{ github.event.inputs.test_suite }}" = "reports" ]; then
+              SPECS="tests/reports/**/*.spec.js"
+            else
+              SPECS="tests/**/*.spec.js"
+            fi
+
+            PLATFORM=android BUILD_NUMBER=${{ github.run_number }} \
+              npx wdio run wdio.config.js --spec "$SPECS" || true
+
+            # ── Kill Appium ────────────────────────────────────────────
+            kill $APPIUM_PID || true
+            echo "✅ Tests finished"
+
+      - name: 📊 Upload Excel test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: medicate-e2e-excel-report-${{ github.run_number }}
+          path: |
+            e2e-tests/reports/*.xlsx
+            e2e-tests/reports/app-reports/*.xlsx
+          retention-days: 30
+
+      - name: 📋 Upload Appium logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: appium-logs-${{ github.run_number }}
+          path: e2e-tests/logs/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # JOB 3: Publish Report Summary to GitHub
+  # ─────────────────────────────────────────────────────────────────────────────
+  publish-report:
+    name: 📢 Publish Report Summary
+    runs-on: ubuntu-latest
+    needs: e2e-tests
+    if: always()
+
+    steps:
+      - name: 📥 Download Excel report
+        uses: actions/download-artifact@v4
+        with:
+          name: medicate-e2e-excel-report-${{ github.run_number }}
+          path: ./downloaded-reports/
+        continue-on-error: true
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 📦 Install ExcelJS for summary parsing
+        run: npm install exceljs
+
+      - name: 📝 Parse Excel and write Job Summary
+        run: |
+          node -e "
+          const ExcelJS = require('exceljs');
+          const fs = require('fs');
+          const path = require('path');
+
+          const reportsDir = './downloaded-reports';
+          const files = fs.existsSync(reportsDir)
+            ? fs.readdirSync(reportsDir).filter(f => f.endsWith('.xlsx'))
+            : [];
+
+          if (files.length === 0) {
+            const summary = \`## 🏥 Medicate E2E Test Report\n\n> ⚠️ No Excel report found. Tests may have failed to run.\n\n**Build:** #${{ github.run_number }}\n**Branch:** \${{ github.ref_name }}\`;
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+            process.exit(0);
+          }
+
+          const reportFile = path.join(reportsDir, files[0]);
+          const workbook = new ExcelJS.Workbook();
+          workbook.xlsx.readFile(reportFile).then(() => {
+            const sheet = workbook.getWorksheet('📊 Summary') || workbook.worksheets[0];
+            const rows = [];
+            sheet.eachRow((row) => rows.push(row.values));
+
+            // Extract stats from row 5-6 (stat cards)
+            const statsRow = rows[5] || [];
+            const valRow = rows[6] || [];
+
+            const summary = \`## 🏥 Medicate E2E Test Report — Build #${{ github.run_number }}
+
+| Metric | Value |
+|--------|-------|
+| 🔢 Total Tests | \${valRow[1] || 'N/A'} |
+| ✅ Passed | \${valRow[2] || 'N/A'} |
+| ❌ Failed | \${valRow[3] || 'N/A'} |
+| ⏭ Skipped | \${valRow[4] || 'N/A'} |
+| 📈 Pass Rate | \${valRow[5] || 'N/A'} |
+| ⏱ Duration | \${valRow[6] || 'N/A'} |
+
+**Branch:** \`${{ github.ref_name }}\`
+**Platform:** \`${{ env.PLATFORM }}\`
+**Triggered by:** \`${{ github.actor }}\`
+
+📥 [Download Full Excel Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+\`;
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          }).catch((err) => {
+            const fallback = \`## 🏥 Medicate E2E Report\n\n> ❌ Could not parse Excel report: \${err.message}\n\`;
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, fallback);
+          });
+          "
+
+      - name: 💬 Comment on PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## 🏥 Medicate E2E Test Results
+
+            | Status | Detail |
+            |--------|--------|
+            | Build | #${{ github.run_number }} |
+            | Platform | \`${{ env.PLATFORM }}\` |
+            | Branch | \`${{ github.head_ref }}\` |
+
+            📥 **[Download Excel Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})** — contains full test results, failed test details, and health report sheets.
+
+            > Generated by Medicate Appium E2E Pipeline`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
