@@ -30,7 +30,7 @@ on:
           - reports
 
 env:
-  FLUTTER_VERSION: '3.22.0'
+  FLUTTER_VERSION: '3.24.0'
   JAVA_VERSION: '17'
   NODE_VERSION: '20'
   ANDROID_API_LEVEL: '33'
@@ -64,25 +64,29 @@ jobs:
           cache: true
 
       - name: Install Flutter dependencies
-        working-directory: medicate/medicate
-        run: flutter pub get
+        working-directory: medicate
+        run: |
+          flutter pub get
+          echo "✅ Flutter dependencies installed"
 
       - name: Flutter analyze
-        working-directory: medicate/medicate
+        working-directory: medicate
         run: flutter analyze --no-fatal-infos
         continue-on-error: true
 
       - name: Build debug APK
-        working-directory: medicate/medicate
+        working-directory: medicate
         run: |
           flutter build apk --debug \
-            --target-platform android-x64
+            --target-platform android-x64 \
+            --no-tree-shake-icons
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: medicate-debug-apk
-          path: medicate/medicate/build/app/outputs/flutter-apk/app-debug.apk
+          path: medicate/build/app/outputs/flutter-apk/app-debug.apk
+          if-no-files-found: warn
           retention-days: 3
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -125,7 +129,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: medicate-debug-apk
-          path: medicate/medicate/build/app/outputs/flutter-apk/
+          path: medicate/build/app/outputs/flutter-apk/
 
       - name: Enable KVM hardware acceleration
         run: |
@@ -148,7 +152,7 @@ jobs:
             adb shell input keyevent 82
             echo "Emulator ready"
 
-            adb install -r medicate/medicate/build/app/outputs/flutter-apk/app-debug.apk
+            adb install -r medicate/build/app/outputs/flutter-apk/app-debug.apk
             echo "APK installed"
 
             appium --log ./e2e-tests/logs/appium.log &

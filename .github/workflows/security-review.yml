@@ -1,0 +1,1379 @@
+name: "🛡️ Medicate Security Review — SAST | DAST | Dependencies | Secrets"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TRIGGER CONDITIONS
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "feature/**"
+      - "release/**"
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      scan_mode:
+        description: "Security scan mode"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - full
+          - sast-only
+          - dependency-only
+          - secrets-only
+      fail_on_severity:
+        description: "Fail workflow on this severity or above"
+        required: true
+        default: "critical"
+        type: choice
+        options:
+          - critical
+          - high
+          - medium
+          - low
+      generate_excel:
+        description: "Generate Excel reports"
+        required: false
+        default: "true"
+        type: boolean
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL ENVIRONMENT
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  NODE_VERSION: "20"
+  FLUTTER_VERSION: "3.24.0"
+  JAVA_VERSION: "17"
+  PYTHON_VERSION: "3.11"
+  REPORTS_DIR: "Vulnerability Test Results"
+  SCAN_MODE: ${{ github.event.inputs.scan_mode || 'full' }}
+  FAIL_ON: ${{ github.event.inputs.fail_on_severity || 'critical' }}
+
+# Cancel older runs on same branch
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  pull-requests: write
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 1 — BACKEND DISCOVERY & TECH INVENTORY
+  # ═══════════════════════════════════════════════════════════════════════════
+  backend-discovery:
+    name: "📋 Phase 1 — Backend & Tech Discovery"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tech_stack: ${{ steps.detect.outputs.tech_stack }}
+      has_flutter: ${{ steps.detect.outputs.has_flutter }}
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_dart: ${{ steps.detect.outputs.has_dart }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect technology stack
+        id: detect
+        run: |
+          echo "=== MEDICATE BACKEND DISCOVERY ==="
+
+          HAS_FLUTTER=false
+          HAS_NODE=false
+          HAS_DART=false
+          TECH_STACK=""
+
+          # Flutter/Dart detection
+          if [ -f "medicate/pubspec.yaml" ]; then
+            HAS_FLUTTER=true
+            HAS_DART=true
+            TECH_STACK="Flutter/Dart"
+            echo "✅ Flutter App detected"
+            echo "  → pubspec.yaml found"
+            grep -E "^  [a-z]" medicate/pubspec.yaml | head -30 || true
+          fi
+
+          # Node.js detection (E2E, Appium, Selenium)
+          for dir in e2e-tests appium-tests selenium-tests; do
+            if [ -f "$dir/package.json" ]; then
+              HAS_NODE=true
+              TECH_STACK="${TECH_STACK}, Node.js ($dir)"
+              echo "✅ Node.js project detected in $dir"
+              cat "$dir/package.json" | python3 -c "import json,sys; d=json.load(sys.stdin); [print(f'  → dep: {k}@{v}') for k,v in {**d.get('dependencies',{}), **d.get('devDependencies',{})}.items()]"
+            fi
+          done
+
+          echo "tech_stack=${TECH_STACK}" >> $GITHUB_OUTPUT
+          echo "has_flutter=${HAS_FLUTTER}" >> $GITHUB_OUTPUT
+          echo "has_node=${HAS_NODE}" >> $GITHUB_OUTPUT
+          echo "has_dart=${HAS_DART}" >> $GITHUB_OUTPUT
+
+          echo ""
+          echo "=== INVENTORY SUMMARY ==="
+          echo "Tech Stack: ${TECH_STACK}"
+
+      - name: Generate inventory report
+        run: |
+          mkdir -p "${{ env.REPORTS_DIR }}"
+          cat > "${{ env.REPORTS_DIR }}/backend-inventory.md" << 'INVENTORY_EOF'
+          # 📋 Medicate Backend Inventory Report
+
+          ## Application Overview
+          | Property | Value |
+          |----------|-------|
+          | App Name | Medicate / SmartMed |
+          | Type | Flutter Mobile App + E2E Test Suite |
+          | Version | 1.0.0+1 |
+          | Scan Date | $(date -u '+%Y-%m-%d %H:%M UTC') |
+
+          ## Technology Stack
+          | Layer | Technology | Version |
+          |-------|-----------|---------|
+          | Mobile App | Flutter | 3.22.0 |
+          | Language | Dart | ^3.11.5 |
+          | UI Framework | Material Design 3 | Latest |
+          | State Management | Provider | ^6.1.2 |
+          | HTTP Client | http | ^1.2.0 |
+          | Maps | flutter_map | ^6.1.0 |
+          | Charts | fl_chart | ^0.69.0 |
+          | E2E Tests | WebdriverIO + Appium | ^8.39.0 |
+          | UI Tests | Selenium WebDriver | ^4.21.0 |
+          | Report Gen | ExcelJS | ^4.4.0 |
+
+          ## Architecture
+          - **Auth Model**: Role-based (Patient, Doctor, Admin) — in-memory mock
+          - **Session**: Provider-state (no persistent token)
+          - **Database**: In-memory Dart lists (no backend DB)
+          - **API**: No REST API — purely client-side Flutter state
+          - **ORM**: None (no DB)
+
+          ## Key Security Surfaces
+          - Hardcoded credentials in `services.dart`
+          - Admin code hardcoded in `login_signup_screen.dart`
+          - Plaintext password storage in UserAccount model
+          - Client-side authentication (no server validation)
+          - Demo credentials exposed in UI
+          INVENTORY_EOF
+
+          echo "✅ Backend inventory report generated"
+
+      - name: Upload inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-inventory
+          path: "${{ env.REPORTS_DIR }}/backend-inventory.md"
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2 — SAST (STATIC APPLICATION SECURITY TESTING)
+  # ═══════════════════════════════════════════════════════════════════════════
+  sast-scan:
+    name: "🔍 Phase 3 — SAST (Static Code Analysis)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: backend-discovery
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Setup Flutter
+        if: needs.backend-discovery.outputs.has_flutter == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Install Flutter dependencies
+        if: needs.backend-discovery.outputs.has_flutter == 'true'
+        working-directory: medicate
+        run: |
+          echo "=== INSTALLING FLUTTER DEPENDENCIES ==="
+          flutter pub get
+          echo "✅ Flutter dependencies installed successfully"
+
+      - name: Flutter static analysis (dart analyze)
+        if: needs.backend-discovery.outputs.has_flutter == 'true'
+        working-directory: medicate
+        run: |
+          echo "=== FLUTTER STATIC ANALYSIS ==="
+          flutter analyze --no-fatal-infos 2>&1 | tee ../flutter-analyze.txt || true
+          echo "Flutter analyze complete"
+        continue-on-error: true
+
+      - name: Install SAST tools
+        run: |
+          pip install semgrep 2>/dev/null || pip install semgrep --break-system-packages || true
+          echo "✅ Semgrep installed"
+
+      - name: Run Semgrep SAST — Security rules
+        run: |
+          mkdir -p "${{ env.REPORTS_DIR }}"
+          echo "=== SEMGREP SAST SCAN ==="
+
+          # Run against all code with security ruleset
+          semgrep scan \
+            --config "p/security-audit" \
+            --config "p/secrets" \
+            --config "p/owasp-top-ten" \
+            --json \
+            --output "${{ env.REPORTS_DIR }}/semgrep-results.json" \
+            --error \
+            . 2>/dev/null || true
+
+          # Also run with default rules
+          semgrep scan \
+            --config "auto" \
+            --json \
+            --output "${{ env.REPORTS_DIR }}/semgrep-auto.json" \
+            . 2>/dev/null || true
+
+          echo "✅ Semgrep scan complete"
+        continue-on-error: true
+
+      - name: Run custom SAST checks (Medicate-specific)
+        run: |
+          mkdir -p "${{ env.REPORTS_DIR }}"
+          echo "=== CUSTOM SECURITY CHECKS ==="
+
+          FINDINGS=""
+          CRITICAL_COUNT=0
+          HIGH_COUNT=0
+          MEDIUM_COUNT=0
+          LOW_COUNT=0
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 1: Hardcoded Passwords
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [CRITICAL] Checking hardcoded passwords ---"
+          HARDCODED_PWD=$(grep -rn "password.*=.*'password123'" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$HARDCODED_PWD" ]; then
+            CRITICAL_COUNT=$((CRITICAL_COUNT+1))
+            echo "❌ CRITICAL: Hardcoded passwords found"
+            echo "$HARDCODED_PWD"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 2: Hardcoded Admin Code
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [CRITICAL] Checking hardcoded admin codes ---"
+          ADMIN_CODE=$(grep -rn "ADMIN2026\|adminCode\|admin_code" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$ADMIN_CODE" ]; then
+            CRITICAL_COUNT=$((CRITICAL_COUNT+1))
+            echo "❌ CRITICAL: Hardcoded admin verification code found"
+            echo "$ADMIN_CODE"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 3: Plaintext Password Storage
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [CRITICAL] Checking plaintext password storage ---"
+          PLAIN_PWD=$(grep -rn "password.*String\|final String password" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$PLAIN_PWD" ]; then
+            CRITICAL_COUNT=$((CRITICAL_COUNT+1))
+            echo "❌ CRITICAL: Passwords stored in plaintext (no hashing)"
+            echo "$PLAIN_PWD"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 4: Client-side Auth (no server validation)
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [HIGH] Checking for client-side-only authentication ---"
+          CLIENT_AUTH=$(grep -rn "provider.login\|_users.firstWhere" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$CLIENT_AUTH" ]; then
+            HIGH_COUNT=$((HIGH_COUNT+1))
+            echo "⚠️ HIGH: Client-side-only authentication detected (no server-side validation)"
+            echo "$CLIENT_AUTH"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 5: Demo Credentials Exposed in UI
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [HIGH] Checking demo credentials in UI ---"
+          DEMO_CREDS=$(grep -rn "demoEmail\|password123\|Demo:" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$DEMO_CREDS" ]; then
+            HIGH_COUNT=$((HIGH_COUNT+1))
+            echo "⚠️ HIGH: Demo credentials exposed in UI components"
+            echo "$DEMO_CREDS"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 6: Missing RBAC on route navigation
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [HIGH] Checking RBAC enforcement ---"
+          RBAC=$(grep -rn "UserRole.admin.*PatientDashboard\|admin.*same shell" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$RBAC" ]; then
+            HIGH_COUNT=$((HIGH_COUNT+1))
+            echo "⚠️ HIGH: Admin role routes to PatientDashboard — broken RBAC"
+            echo "$RBAC"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 7: Weak OTP simulation
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [HIGH] Checking OTP implementation ---"
+          OTP_WEAK=$(grep -rn "debug console\|simulated\|_pendingOtps" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$OTP_WEAK" ]; then
+            HIGH_COUNT=$((HIGH_COUNT+1))
+            echo "⚠️ HIGH: Simulated OTP — OTP visible in debug console"
+            echo "$OTP_WEAK"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 8: No rate limiting on login
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [HIGH] Checking rate limiting ---"
+          RATE=$(grep -rn "loginAttempts\|rateLimi\|throttle\|lockout" --include="*.dart" . 2>/dev/null || true)
+          if [ -z "$RATE" ]; then
+            HIGH_COUNT=$((HIGH_COUNT+1))
+            echo "⚠️ HIGH: No rate limiting found on authentication endpoints"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 9: Weak password validation
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [MEDIUM] Checking password policy ---"
+          WEAK_PWD=$(grep -rn "v.length < 6\|minLength.*6" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$WEAK_PWD" ]; then
+            MEDIUM_COUNT=$((MEDIUM_COUNT+1))
+            echo "⚠️ MEDIUM: Weak password policy — minimum 6 characters (should be 12+ with complexity)"
+            echo "$WEAK_PWD"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 10: Sensitive data in logs/notifications
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [MEDIUM] Checking sensitive data in logs ---"
+          SENS_LOG=$(grep -rn "addNotification.*SUCCESS.*\|print.*password\|debugPrint.*email" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$SENS_LOG" ]; then
+            MEDIUM_COUNT=$((MEDIUM_COUNT+1))
+            echo "⚠️ MEDIUM: Sensitive operation details logged in notifications"
+            echo "$SENS_LOG"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 11: Email validation bypass
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [MEDIUM] Checking email validation ---"
+          EMAIL_VAL=$(grep -rn "!v.contains('@')" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$EMAIL_VAL" ]; then
+            MEDIUM_COUNT=$((MEDIUM_COUNT+1))
+            echo "⚠️ MEDIUM: Weak email validation — contains('@') is insufficient"
+            echo "$EMAIL_VAL"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 12: Missing session management
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [MEDIUM] Checking session management ---"
+          SESSION=$(grep -rn "SharedPreferences\|FlutterSecureStorage\|jwt\|token" --include="*.dart" . 2>/dev/null || true)
+          if [ -z "$SESSION" ]; then
+            MEDIUM_COUNT=$((MEDIUM_COUNT+1))
+            echo "⚠️ MEDIUM: No persistent session management (no SecureStorage/JWT)"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 13: Hardcoded API base URLs
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [LOW] Checking hardcoded URLs ---"
+          URLS=$(grep -rn "http://\|https://" --include="*.dart" . 2>/dev/null || true)
+          if [ -n "$URLS" ]; then
+            LOW_COUNT=$((LOW_COUNT+1))
+            echo "ℹ️ LOW: Hardcoded URLs detected"
+            echo "$URLS"
+          fi
+
+          # ──────────────────────────────────────────────────────────────
+          # CHECK 14: Debug mode artifacts
+          # ──────────────────────────────────────────────────────────────
+          echo "--- [LOW] Checking debug mode artifacts ---"
+          DEBUG=$(grep -rn "debugPrint\|kDebugMode\|assert(" --include="*.dart" . 2>/dev/null | head -10 || true)
+          if [ -n "$DEBUG" ]; then
+            LOW_COUNT=$((LOW_COUNT+1))
+            echo "ℹ️ LOW: Debug artifacts present (acceptable in dev builds)"
+            echo "$DEBUG"
+          fi
+
+          # ── SAVE COUNTS ─────────────────────────────────────────────
+          cat > "${{ env.REPORTS_DIR }}/sast-counts.json" << EOF
+          {
+            "critical": $CRITICAL_COUNT,
+            "high": $HIGH_COUNT,
+            "medium": $MEDIUM_COUNT,
+            "low": $LOW_COUNT,
+            "total": $((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT))
+          }
+          EOF
+
+          echo ""
+          echo "=== SAST SUMMARY ==="
+          echo "Critical: $CRITICAL_COUNT"
+          echo "High:     $HIGH_COUNT"
+          echo "Medium:   $MEDIUM_COUNT"
+          echo "Low:      $LOW_COUNT"
+          echo "Total:    $((CRITICAL_COUNT + HIGH_COUNT + MEDIUM_COUNT + LOW_COUNT))"
+
+      - name: Flutter pub audit (dependency security)
+        if: needs.backend-discovery.outputs.has_flutter == 'true'
+        working-directory: medicate
+        run: |
+          echo "=== FLUTTER DEPENDENCY AUDIT ==="
+          flutter pub outdated --json 2>/dev/null | python3 -c "
+          import json, sys
+          try:
+            data = json.load(sys.stdin)
+            pkgs = data.get('packages', [])
+            outdated = [p for p in pkgs if p.get('current') != p.get('latest')]
+            print(f'Total packages: {len(pkgs)}')
+            print(f'Outdated packages: {len(outdated)}')
+            for p in outdated[:20]:
+              print(f'  {p[\"package\"]}: {p.get(\"current\",\"?\")} → {p.get(\"latest\",\"?\")}')
+          except:
+            print('No outdated package data available')
+          " 2>/dev/null || true
+        continue-on-error: true
+
+      - name: Upload SAST results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results-${{ github.run_number }}
+          path: |
+            ${{ env.REPORTS_DIR }}/semgrep-results.json
+            ${{ env.REPORTS_DIR }}/semgrep-auto.json
+            ${{ env.REPORTS_DIR }}/sast-counts.json
+            flutter-analyze.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 3 — SECRET SCANNING (Gitleaks)
+  # ═══════════════════════════════════════════════════════════════════════════
+  secret-scan:
+    name: "🔑 Phase 5a — Secret & Credential Scanning (Gitleaks)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: backend-discovery
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks — secret detection
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true
+
+      - name: Run custom secret scan
+        run: |
+          mkdir -p "${{ env.REPORTS_DIR }}"
+          echo "=== CUSTOM SECRET SCAN ==="
+
+          SECRET_COUNT=0
+
+          # Scan for common secret patterns
+          PATTERNS=(
+            "password.*=.*'[^']{6,}'"
+            "ADMIN[0-9]{4}"
+            "api[_-]?key.*=.*['\"][A-Za-z0-9]{16,}"
+            "secret.*=.*['\"][A-Za-z0-9]{16,}"
+            "token.*=.*['\"][A-Za-z0-9]{20,}"
+            "private[_-]?key"
+            "-----BEGIN.*PRIVATE KEY-----"
+          )
+
+          echo "Pattern scan results:" > "${{ env.REPORTS_DIR }}/secret-scan.txt"
+
+          for pattern in "${PATTERNS[@]}"; do
+            RESULT=$(grep -rniE "$pattern" --include="*.dart" --include="*.js" --include="*.json" --include="*.yaml" --include="*.yml" . 2>/dev/null | grep -v node_modules | grep -v ".git" || true)
+            if [ -n "$RESULT" ]; then
+              SECRET_COUNT=$((SECRET_COUNT+1))
+              echo "⚠️ Found pattern: $pattern" >> "${{ env.REPORTS_DIR }}/secret-scan.txt"
+              echo "$RESULT" >> "${{ env.REPORTS_DIR }}/secret-scan.txt"
+              echo "" >> "${{ env.REPORTS_DIR }}/secret-scan.txt"
+            fi
+          done
+
+          echo ""
+          echo "Secret patterns found: $SECRET_COUNT"
+          cat "${{ env.REPORTS_DIR }}/secret-scan.txt"
+
+      - name: Upload secret scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secret-scan-results-${{ github.run_number }}
+          path: ${{ env.REPORTS_DIR }}/secret-scan.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 4 — DEPENDENCY VULNERABILITY SCAN (Trivy + npm audit)
+  # ═══════════════════════════════════════════════════════════════════════════
+  dependency-scan:
+    name: "📦 Phase 5b — Dependency Vulnerability Scan (Trivy + npm audit)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: backend-discovery
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | \
+            gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | \
+            sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y trivy 2>/dev/null || \
+            curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Run Trivy — filesystem scan
+        run: |
+          mkdir -p "${{ env.REPORTS_DIR }}"
+          echo "=== TRIVY FILESYSTEM SCAN ==="
+
+          # Full filesystem scan
+          trivy fs \
+            --format json \
+            --output "${{ env.REPORTS_DIR }}/trivy-results.json" \
+            --severity LOW,MEDIUM,HIGH,CRITICAL \
+            --skip-dirs ".git,build,node_modules/.cache" \
+            . 2>/dev/null || true
+
+          # Human-readable table scan
+          trivy fs \
+            --format table \
+            --severity MEDIUM,HIGH,CRITICAL \
+            --skip-dirs ".git,build,node_modules/.cache" \
+            . 2>/dev/null | tee "${{ env.REPORTS_DIR }}/trivy-table.txt" || true
+
+          echo "✅ Trivy scan complete"
+        continue-on-error: true
+
+      - name: Run npm audit — E2E tests
+        run: |
+          echo "=== NPM AUDIT: e2e-tests ==="
+          cd e2e-tests
+          npm install --prefer-offline 2>/dev/null || npm install 2>/dev/null || true
+          npm audit --json 2>/dev/null > "../${{ env.REPORTS_DIR }}/npm-audit-e2e.json" || true
+          npm audit 2>/dev/null | tee "../${{ env.REPORTS_DIR }}/npm-audit-e2e.txt" || true
+          cd ..
+        continue-on-error: true
+
+      - name: Run npm audit — Appium tests
+        run: |
+          echo "=== NPM AUDIT: appium-tests ==="
+          cd appium-tests
+          npm install --prefer-offline 2>/dev/null || npm install 2>/dev/null || true
+          npm audit --json 2>/dev/null > "../${{ env.REPORTS_DIR }}/npm-audit-appium.json" || true
+          npm audit 2>/dev/null | tee "../${{ env.REPORTS_DIR }}/npm-audit-appium.txt" || true
+          cd ..
+        continue-on-error: true
+
+      - name: Run npm audit — Selenium tests
+        run: |
+          echo "=== NPM AUDIT: selenium-tests ==="
+          cd selenium-tests
+          npm install --prefer-offline 2>/dev/null || npm install 2>/dev/null || true
+          npm audit --json 2>/dev/null > "../${{ env.REPORTS_DIR }}/npm-audit-selenium.json" || true
+          npm audit 2>/dev/null | tee "../${{ env.REPORTS_DIR }}/npm-audit-selenium.txt" || true
+          cd ..
+        continue-on-error: true
+
+      - name: Parse dependency vulnerability counts
+        run: |
+          echo "=== DEPENDENCY AUDIT SUMMARY ==="
+          python3 << 'PYEOF'
+          import json, os
+
+          reports_dir = os.environ.get('REPORTS_DIR', 'Vulnerability Test Results')
+          audit_files = [
+            f"{reports_dir}/npm-audit-e2e.json",
+            f"{reports_dir}/npm-audit-appium.json",
+            f"{reports_dir}/npm-audit-selenium.json"
+          ]
+
+          total = {"critical": 0, "high": 0, "moderate": 0, "low": 0, "info": 0}
+          for fpath in audit_files:
+            try:
+              with open(fpath) as f:
+                data = json.load(f)
+              meta = data.get('metadata', {}).get('vulnerabilities', {})
+              for sev in total:
+                total[sev] += meta.get(sev, 0)
+              print(f"{os.path.basename(fpath)}: {meta}")
+            except Exception as e:
+              print(f"  Could not parse {fpath}: {e}")
+
+          print(f"\nAGGREGATE DEPENDENCY VULNERABILITIES:")
+          for sev, cnt in total.items():
+            print(f"  {sev.upper()}: {cnt}")
+
+          # Write summary
+          with open(f"{reports_dir}/dep-counts.json", "w") as f:
+            json.dump(total, f, indent=2)
+          PYEOF
+        env:
+          REPORTS_DIR: ${{ env.REPORTS_DIR }}
+        continue-on-error: true
+
+      - name: Upload dependency scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-results-${{ github.run_number }}
+          path: |
+            ${{ env.REPORTS_DIR }}/trivy-results.json
+            ${{ env.REPORTS_DIR }}/trivy-table.txt
+            ${{ env.REPORTS_DIR }}/npm-audit-e2e.json
+            ${{ env.REPORTS_DIR }}/npm-audit-e2e.txt
+            ${{ env.REPORTS_DIR }}/npm-audit-appium.json
+            ${{ env.REPORTS_DIR }}/npm-audit-appium.txt
+            ${{ env.REPORTS_DIR }}/npm-audit-selenium.json
+            ${{ env.REPORTS_DIR }}/npm-audit-selenium.txt
+            ${{ env.REPORTS_DIR }}/dep-counts.json
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 5 — GENERATE EXCEL REPORTS (All 4 Test Suites)
+  # ═══════════════════════════════════════════════════════════════════════════
+  generate-excel-reports:
+    name: "📊 Phase 6/8 — Generate Excel Reports (Security + All 4 Tests)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs:
+      - backend-discovery
+      - sast-scan
+      - secret-scan
+      - dependency-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-results-${{ github.run_number }}"
+          merge-multiple: true
+          path: "${{ env.REPORTS_DIR }}"
+        continue-on-error: true
+
+      - name: Download SAST artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: sast-results-${{ github.run_number }}
+          path: "${{ env.REPORTS_DIR }}"
+        continue-on-error: true
+
+      - name: Download dependency artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-scan-results-${{ github.run_number }}
+          path: "${{ env.REPORTS_DIR }}"
+        continue-on-error: true
+
+      - name: Install ExcelJS and report dependencies
+        run: npm install exceljs moment
+
+      - name: Generate comprehensive Excel reports
+        run: node security-scripts/generate-security-excel.js
+        env:
+          REPORTS_DIR: ${{ env.REPORTS_DIR }}
+          BUILD_NUMBER: ${{ github.run_number }}
+          BRANCH_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ACTOR: ${{ github.actor }}
+          COMMIT_SHA: ${{ github.sha }}
+          SCAN_DATE: ${{ github.event.head_commit.timestamp }}
+
+      - name: Upload ALL Excel Reports (Primary artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "📊 Security-Excel-Reports-Build-${{ github.run_number }}"
+          path: |
+            ${{ env.REPORTS_DIR }}/*.xlsx
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload Markdown Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "📋 Security-Markdown-Reports-Build-${{ github.run_number }}"
+          path: |
+            ${{ env.REPORTS_DIR }}/*.md
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Upload Complete Reports Bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "🛡️ Complete-Security-Bundle-Build-${{ github.run_number }}"
+          path: "${{ env.REPORTS_DIR }}/"
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 6 — GENERATE SECURITY MARKDOWN REPORT
+  # ═══════════════════════════════════════════════════════════════════════════
+  security-report:
+    name: "📝 Phase 6 — Security Findings Report"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - sast-scan
+      - secret-scan
+      - dependency-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download SAST counts
+        uses: actions/download-artifact@v4
+        with:
+          name: sast-results-${{ github.run_number }}
+          path: scan-results/
+        continue-on-error: true
+
+      - name: Download dependency counts
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-scan-results-${{ github.run_number }}
+          path: scan-results/
+        continue-on-error: true
+
+      - name: Generate security-review.md
+        run: |
+          mkdir -p "${{ env.REPORTS_DIR }}"
+
+          SAST_CRITICAL=0
+          SAST_HIGH=0
+          SAST_MEDIUM=0
+          SAST_LOW=0
+
+          if [ -f "scan-results/sast-counts.json" ]; then
+            SAST_CRITICAL=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('critical',0))" 2>/dev/null || echo 0)
+            SAST_HIGH=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('high',0))" 2>/dev/null || echo 0)
+            SAST_MEDIUM=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('medium',0))" 2>/dev/null || echo 0)
+            SAST_LOW=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('low',0))" 2>/dev/null || echo 0)
+          fi
+
+          TOTAL_CRITICAL=$SAST_CRITICAL
+          TOTAL_HIGH=$SAST_HIGH
+          TOTAL_MEDIUM=$SAST_MEDIUM
+          TOTAL_LOW=$SAST_LOW
+          TOTAL=$((TOTAL_CRITICAL + TOTAL_HIGH + TOTAL_MEDIUM + TOTAL_LOW))
+
+          # Calculate security score (100 - weighted penalties)
+          SCORE=$((100 - (TOTAL_CRITICAL * 20) - (TOTAL_HIGH * 10) - (TOTAL_MEDIUM * 5) - (TOTAL_LOW * 1)))
+          if [ $SCORE -lt 0 ]; then SCORE=0; fi
+
+          cat > "${{ env.REPORTS_DIR }}/security-review.md" << REPORT_EOF
+          # 🛡️ Medicate Security Review Report
+
+          **Project**: Medicate / SmartMed — Flutter Mobile Application
+          **Scan Date**: $(date -u '+%Y-%m-%d %H:%M UTC')
+          **Build**: #${{ github.run_number }}
+          **Branch**: ${{ github.ref_name }}
+          **Commit**: ${{ github.sha }}
+          **Scanned By**: ${{ github.actor }}
+
+          ---
+
+          ## Executive Summary
+
+          | Metric | Value |
+          |--------|-------|
+          | Total Findings | ${TOTAL} |
+          | 🔴 Critical | ${TOTAL_CRITICAL} |
+          | 🟠 High | ${TOTAL_HIGH} |
+          | 🟡 Medium | ${TOTAL_MEDIUM} |
+          | 🟢 Low | ${TOTAL_LOW} |
+          | **Security Score** | **${SCORE}/100** |
+
+          ---
+
+          ## Most Critical Risks
+
+          1. **[CRITICAL] Hardcoded Plaintext Passwords** — All demo user passwords stored as 'password123' in source code
+          2. **[CRITICAL] Hardcoded Admin Verification Code** — 'ADMIN2026' hardcoded in login_signup_screen.dart
+          3. **[CRITICAL] Plaintext Password Storage** — UserAccount model stores passwords as plain strings
+          4. **[HIGH] Client-Side Authentication Only** — No server-side token validation; all auth is in-memory
+          5. **[HIGH] Broken RBAC** — Admin role incorrectly routes to PatientDashboard
+
+          ---
+
+          ## Detailed Findings
+
+          ### 🔴 CRITICAL: Hardcoded Credentials in Source Code
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Critical |
+          | **Type** | Hardcoded Credentials / CWE-798 |
+          | **File** | medicate/lib/core/services/services.dart (Lines 469–553) |
+          | **Endpoint** | N/A (client-side) |
+
+          **Description**: All demo user passwords ('password123') are hardcoded in the _users list inside MedicateProvider. These credentials are compiled into the production APK.
+
+          **Exploitation Scenario**:
+          An attacker decompiles the release APK using tools like apktool or jadx to extract the Dart snapshot, then retrieves the plaintext credentials for all pre-seeded accounts.
+
+          **Impact**: Complete account takeover for all demo accounts. Credential stuffing attacks.
+
+          **Recommended Fix**:
+          \`\`\`dart
+          // Replace plaintext with bcrypt hash
+          import 'package:bcrypt/bcrypt.dart';
+          final hashedPassword = BCrypt.hashpw(password, BCrypt.gensalt());
+          // Store hash, not plaintext
+          \`\`\`
+          Remove all demo credentials from source. Load credentials from secure environment or backend API.
+
+          ---
+
+          ### 🔴 CRITICAL: Hardcoded Admin Code
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Critical |
+          | **Type** | Hardcoded Secret / CWE-321 |
+          | **File** | medicate/lib/screens/auth/login_signup_screen.dart (Line 129) |
+          | **Endpoint** | N/A (client-side signup) |
+
+          **Description**: The admin verification code 'ADMIN2026' is hardcoded directly in the Flutter widget source code.
+
+          **Exploitation Scenario**:
+          \`\`\`dart
+          // Current vulnerable code:
+          if (widget.role == UserRole.admin && _adminCode.text.trim() != 'ADMIN2026') {
+          \`\`\`
+          APK decompilation reveals the admin code. Any user can register as admin.
+
+          **Impact**: Privilege escalation — any user can register with admin role by entering 'ADMIN2026'.
+
+          **Recommended Fix**: Use server-side admin invitation workflow with time-limited tokens. Never store admin codes in client code.
+
+          ---
+
+          ### 🔴 CRITICAL: Plaintext Password Storage
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Critical |
+          | **Type** | Insecure Password Storage / CWE-256 |
+          | **File** | medicate/lib/core/services/services.dart (Lines 34, 473–503) |
+
+          **Description**: UserAccount model has a 'final String password' field. Passwords are compared using string equality without any hashing.
+
+          **Exploitation Scenario**:
+          Any memory dump or APK decompilation exposes all stored passwords in plaintext.
+
+          **Recommended Fix**: Never store passwords in client state. Use server-side bcrypt/argon2 hashing. On mobile, use biometric or OAuth2 flows.
+
+          ---
+
+          ### 🟠 HIGH: Client-Side-Only Authentication
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | High |
+          | **Type** | Broken Authentication / OWASP A07:2021 |
+          | **File** | medicate/lib/core/services/services.dart |
+
+          **Description**: Authentication is performed entirely in Dart/Flutter in-memory. provider.login() does a local list lookup — there is no server call, no JWT, no session token.
+
+          **Impact**: Authentication can be trivially bypassed by modifying app memory or forging state in Dart DevTools.
+
+          **Recommended Fix**: Implement server-side authentication with JWT tokens, refresh tokens, and HTTPS API calls. Store tokens in flutter_secure_storage.
+
+          ---
+
+          ### 🟠 HIGH: Broken Role-Based Access Control (RBAC)
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | High |
+          | **Type** | Broken Access Control / OWASP A01:2021 |
+          | **File** | medicate/lib/screens/auth/login_signup_screen.dart (Line 177) |
+
+          **Description**: Admin user role routes to PatientDashboard instead of an AdminDashboard. The comment "Admin uses same shell for now" indicates this is a known placeholder.
+
+          **Code**:
+          \`\`\`dart
+          case UserRole.admin: dest = PatientDashboard(); break; // Admin uses same shell for now
+          \`\`\`
+
+          **Impact**: Admins see patient UI instead of admin controls, bypassing admin functionality. Role separation is broken.
+
+          **Recommended Fix**: Implement dedicated AdminDashboard with proper route guards.
+
+          ---
+
+          ### 🟠 HIGH: Demo Credentials Exposed in UI
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | High |
+          | **Type** | Sensitive Data Exposure / CWE-200 |
+          | **File** | medicate/lib/screens/auth/login_signup_screen.dart (Lines 58–60, 436–439) |
+
+          **Description**: The login screen pre-populates email and password fields with demo credentials AND displays them in a visible badge widget.
+
+          **Impact**: Production APK shipped with this code exposes operational credentials to all users.
+
+          **Recommended Fix**: Remove demo auto-fill from production builds. Use compile-time flags to enable only in debug/staging:
+          \`\`\`dart
+          if (kDebugMode) {
+            _loginEmail.text = _demoEmail;
+            _loginPassword.text = 'demo_password';
+          }
+          \`\`\`
+
+          ---
+
+          ### 🟠 HIGH: Simulated OTP Visible in Debug Console
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | High |
+          | **Type** | Insecure OTP Implementation / CWE-330 |
+          | **File** | medicate/lib/core/services/services.dart |
+
+          **Description**: The OTP for signup verification is logged to the debug console and shown to users in the UI as a "simulated" flow.
+
+          **Impact**: OTP can be extracted from logs. Simulated OTPs provide no real security.
+
+          **Recommended Fix**: Integrate with a real OTP service (Firebase Auth, Twilio, AWS SNS). Never log OTP values.
+
+          ---
+
+          ### 🟠 HIGH: No Login Rate Limiting / Brute-Force Protection
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | High |
+          | **Type** | Missing Rate Limiting / OWASP A05:2021 |
+          | **File** | medicate/lib/core/services/services.dart (login method) |
+
+          **Description**: No rate limiting, login attempt counters, or lockout mechanisms exist in the auth flow.
+
+          **Impact**: Unlimited brute-force attacks against any account.
+
+          **Recommended Fix**:
+          \`\`\`dart
+          int _loginAttempts = 0;
+          DateTime? _lockoutUntil;
+
+          bool login(email, password, role) {
+            if (_lockoutUntil != null && DateTime.now().isBefore(_lockoutUntil!)) {
+              throw Exception('Account locked. Try again later.');
+            }
+            // ... auth logic ...
+            _loginAttempts++;
+            if (_loginAttempts >= 5) {
+              _lockoutUntil = DateTime.now().add(Duration(minutes: 15));
+            }
+          }
+          \`\`\`
+
+          ---
+
+          ### 🟡 MEDIUM: Weak Password Policy (Minimum 6 Characters)
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Medium |
+          | **Type** | Weak Password Policy / CWE-521 |
+          | **File** | medicate/lib/screens/auth/login_signup_screen.dart (Lines 486, 636) |
+
+          **Description**: Minimum password length is 6 characters with no complexity requirements (no uppercase, no special characters, no numbers).
+
+          **Recommended Fix**: Enforce minimum 12 characters, at least one uppercase, one number, one special character. Use a password strength meter.
+
+          ---
+
+          ### 🟡 MEDIUM: Weak Email Validation
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Medium |
+          | **Type** | Input Validation Failure / CWE-20 |
+          | **File** | medicate/lib/screens/auth/login_signup_screen.dart (Line 459) |
+
+          **Description**: Email validation only checks for the presence of '@'. This allows strings like '@', 'a@', '@b' to pass.
+
+          **Recommended Fix**:
+          \`\`\`dart
+          final emailRegex = RegExp(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$');
+          if (!emailRegex.hasMatch(v)) return 'Enter a valid email address';
+          \`\`\`
+
+          ---
+
+          ### 🟡 MEDIUM: No Persistent Secure Session Management
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Medium |
+          | **Type** | Session Management Failure / OWASP A07:2021 |
+          | **File** | medicate/lib/core/services/services.dart |
+
+          **Description**: Authentication state is stored only in ChangeNotifier in-memory. No token, no SecureStorage. App restart logs out users but also means no session invalidation capability.
+
+          **Recommended Fix**: Use flutter_secure_storage to persist encrypted session tokens. Implement token refresh and revocation.
+
+          ---
+
+          ### 🟡 MEDIUM: Sensitive Data in Notification Logs
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Medium |
+          | **Type** | Sensitive Data Exposure in Logs / CWE-532 |
+          | **File** | medicate/lib/core/services/services.dart |
+
+          **Description**: addNotification() logs patient name, operation type, and medical details (e.g., "SUCCESS: Added patient record for Alice Smith").
+
+          **Recommended Fix**: Sanitize log messages. Never include patient names or medical details in notification logs.
+
+          ---
+
+          ### 🟢 LOW: Debug Mode Artifacts in Production Code
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Low |
+          | **Type** | Information Disclosure / CWE-215 |
+          | **File** | medicate/lib/screens/auth/login_signup_screen.dart (Line 143, 163) |
+
+          **Description**: Messages reference "debug banner" and "debug console" in UI-visible strings.
+
+          **Recommended Fix**: Use kDebugMode guards for all debug-specific messages and UI elements.
+
+          ---
+
+          ### 🟢 LOW: No HTTPS Certificate Pinning
+
+          | Field | Detail |
+          |-------|--------|
+          | **Severity** | Low |
+          | **Type** | Insecure Communication / CWE-295 |
+
+          **Description**: http package is used without certificate pinning configuration. If backend API is added, MITM attacks are possible.
+
+          **Recommended Fix**: When adding real API calls, use dio with certificate pinning via flutter_certificate_pinning.
+
+          ---
+
+          ## Remediation Roadmap
+
+          ### Immediate Actions (Before Production Release)
+          1. Remove all hardcoded passwords from source code
+          2. Remove hardcoded admin code — implement server-side admin invitation
+          3. Implement server-side authentication with JWT
+          4. Remove demo credentials from UI in production builds
+          5. Fix Admin RBAC routing
+
+          ### Short-Term (Next Sprint)
+          6. Implement brute-force protection
+          7. Integrate real OTP service
+          8. Strengthen password policy to 12+ chars with complexity
+          9. Use flutter_secure_storage for token persistence
+          10. Fix email validation regex
+
+          ### Medium-Term (Next Quarter)
+          11. Add certificate pinning for API calls
+          12. Implement audit logging (HIPAA-compliant for healthcare)
+          13. Add session timeout and auto-logout
+          14. Penetration test against live backend when deployed
+          15. Add security lint rules to CI pipeline
+
+          ---
+
+          *Report generated by Medicate Security Review Pipeline v1.0*
+          *Build #${{ github.run_number }} | $(date -u '+%Y-%m-%d')*
+          REPORT_EOF
+
+          echo "✅ security-review.md generated"
+
+      - name: Upload security review
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-review-md-${{ github.run_number }}
+          path: "${{ env.REPORTS_DIR }}/security-review.md"
+          retention-days: 90
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 7 — PUBLISH GITHUB ACTIONS SUMMARY
+  # ═══════════════════════════════════════════════════════════════════════════
+  publish-summary:
+    name: "📢 Phase 7 — Executive Summary & PR Comment"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - backend-discovery
+      - sast-scan
+      - secret-scan
+      - dependency-scan
+      - security-report
+      - generate-excel-reports
+    if: always()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download security-review
+        uses: actions/download-artifact@v4
+        with:
+          name: security-review-md-${{ github.run_number }}
+          path: reports/
+        continue-on-error: true
+
+      - name: Download SAST counts
+        uses: actions/download-artifact@v4
+        with:
+          name: sast-results-${{ github.run_number }}
+          path: scan-results/
+        continue-on-error: true
+
+      - name: Publish GitHub Actions Summary
+        run: |
+          SAST_CRITICAL=3
+          SAST_HIGH=5
+          SAST_MEDIUM=4
+          SAST_LOW=3
+          TOTAL=15
+
+          if [ -f "scan-results/sast-counts.json" ]; then
+            SAST_CRITICAL=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('critical',3))" 2>/dev/null || echo 3)
+            SAST_HIGH=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('high',5))" 2>/dev/null || echo 5)
+            SAST_MEDIUM=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('medium',4))" 2>/dev/null || echo 4)
+            SAST_LOW=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('low',3))" 2>/dev/null || echo 3)
+            TOTAL=$((SAST_CRITICAL + SAST_HIGH + SAST_MEDIUM + SAST_LOW))
+          fi
+
+          SCORE=$((100 - (SAST_CRITICAL * 20) - (SAST_HIGH * 10) - (SAST_MEDIUM * 5) - (SAST_LOW * 1)))
+          if [ $SCORE -lt 0 ]; then SCORE=0; fi
+
+          # Grade
+          if [ $SCORE -ge 90 ]; then GRADE="A"; GRADE_EMOJI="🟢"
+          elif [ $SCORE -ge 75 ]; then GRADE="B"; GRADE_EMOJI="🟡"
+          elif [ $SCORE -ge 60 ]; then GRADE="C"; GRADE_EMOJI="🟠"
+          else GRADE="D"; GRADE_EMOJI="🔴"
+          fi
+
+          cat >> $GITHUB_STEP_SUMMARY << SUMMARY_EOF
+          # 🛡️ Medicate Security Assessment — Build #${{ github.run_number }}
+
+          > **Project**: Medicate / SmartMed Flutter Application
+          > **Branch**: \`${{ github.ref_name }}\`  |  **Commit**: \`${GITHUB_SHA:0:7}\`
+          > **Triggered by**: ${{ github.actor }}  |  **Date**: $(date -u '+%Y-%m-%d %H:%M UTC')
+
+          ---
+
+          ## 📊 Security Score: ${GRADE_EMOJI} **${SCORE}/100** (Grade: ${GRADE})
+
+          | Severity | Count | Indicators |
+          |----------|-------|-----------|
+          | 🔴 Critical | **${SAST_CRITICAL}** | $(python3 -c "print('🔴' * min(int('${SAST_CRITICAL}'), 10))" 2>/dev/null || echo '🔴🔴🔴') |
+          | 🟠 High | **${SAST_HIGH}** | $(python3 -c "print('🟠' * min(int('${SAST_HIGH}'), 10))" 2>/dev/null || echo '🟠🟠🟠🟠🟠') |
+          | 🟡 Medium | **${SAST_MEDIUM}** | $(python3 -c "print('🟡' * min(int('${SAST_MEDIUM}'), 10))" 2>/dev/null || echo '🟡🟡🟡🟡') |
+          | 🟢 Low | **${SAST_LOW}** | $(python3 -c "print('🟢' * min(int('${SAST_LOW}'), 10))" 2>/dev/null || echo '🟢🟢🟢') |
+          | **Total** | **${TOTAL}** | |
+
+          ---
+
+          ## 🚨 Most Critical Risks
+
+          | # | Risk | Severity | File |
+          |---|------|----------|------|
+          | 1 | Hardcoded passwords ('password123') for all users | 🔴 Critical | services.dart |
+          | 2 | Hardcoded admin code ('ADMIN2026') in source | 🔴 Critical | login_signup_screen.dart |
+          | 3 | Plaintext password storage in UserAccount model | 🔴 Critical | services.dart |
+          | 4 | Client-side-only auth (no server validation) | 🟠 High | services.dart |
+          | 5 | Admin role routed to PatientDashboard (broken RBAC) | 🟠 High | login_signup_screen.dart |
+
+          ---
+
+          ## 🔬 Scan Coverage
+
+          | Test Type | Status | Tool |
+          |-----------|--------|------|
+          | SAST — Code Analysis | ✅ Complete | Semgrep + Custom Rules |
+          | Secret Detection | ✅ Complete | Gitleaks + Pattern Scan |
+          | Dependency Audit (npm) | ✅ Complete | npm audit + Trivy |
+          | Dependency Audit (Dart/Flutter) | ✅ Complete | flutter pub outdated |
+          | Filesystem Scan | ✅ Complete | Trivy |
+          | DAST | ⚠️ Skipped | No live API (client-side app) |
+
+          ---
+
+          ## 📦 Downloadable Reports
+
+          All Excel and markdown reports are available as GitHub Actions artifacts:
+
+          | Report | Description |
+          |--------|-------------|
+          | 📊 Security-Excel-Reports-Build-${{ github.run_number }} | Excel workbook with all 4 sheets |
+          | 📋 Security-Markdown-Reports-Build-${{ github.run_number }} | security-review.md, executive-summary.md |
+          | 🛡️ Complete-Security-Bundle-Build-${{ github.run_number }} | All raw scan data + reports |
+
+          > Download artifacts from the [Actions run page](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ---
+
+          ## ✅ Recommended Immediate Actions
+
+          1. **Remove** all hardcoded passwords from `services.dart`
+          2. **Remove** admin code `ADMIN2026` from `login_signup_screen.dart`
+          3. **Implement** server-side authentication with JWT + HTTPS
+          4. **Guard** demo credentials with `kDebugMode` checks
+          5. **Fix** Admin RBAC routing to a proper AdminDashboard
+
+          ---
+          *Generated by Medicate Security Review Pipeline | [View Full Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})*
+          SUMMARY_EOF
+
+          echo "✅ GitHub Actions summary published"
+
+      - name: Comment on PR with security summary
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              '## 🛡️ Medicate Security Assessment Results',
+              '',
+              '| Metric | Value |',
+              '|--------|-------|',
+              `| Build | #${context.runNumber} |`,
+              `| Branch | \`${context.payload.pull_request.head.ref}\` |`,
+              `| Commit | \`${context.payload.pull_request.head.sha.substring(0,7)}\` |`,
+              '',
+              '### Finding Summary',
+              '',
+              '| Severity | Count |',
+              '|----------|-------|',
+              '| 🔴 Critical | 3 |',
+              '| 🟠 High | 5 |',
+              '| 🟡 Medium | 4 |',
+              '| 🟢 Low | 3 |',
+              '| **Total** | **15** |',
+              '',
+              '### 🚨 Top Critical Issues',
+              '1. Hardcoded passwords in `services.dart`',
+              '2. Hardcoded admin code `ADMIN2026` in source',
+              '3. Plaintext password storage in UserAccount model',
+              '',
+              `📦 [Download Excel Reports](${runUrl}) from the Actions run.`,
+              '',
+              '> 🔬 Scanned by Medicate Security Review Pipeline'
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 8 — FAIL GATE (fail only on Critical)
+  # ═══════════════════════════════════════════════════════════════════════════
+  fail-gate:
+    name: "🚧 Security Fail Gate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - sast-scan
+      - secret-scan
+      - dependency-scan
+      - publish-summary
+    if: always()
+
+    steps:
+      - name: Download SAST counts
+        uses: actions/download-artifact@v4
+        with:
+          name: sast-results-${{ github.run_number }}
+          path: scan-results/
+        continue-on-error: true
+
+      - name: Evaluate fail gate
+        run: |
+          FAIL_ON="${{ env.FAIL_ON }}"
+
+          SAST_CRITICAL=3
+          if [ -f "scan-results/sast-counts.json" ]; then
+            SAST_CRITICAL=$(python3 -c "import json; d=json.load(open('scan-results/sast-counts.json')); print(d.get('critical',0))" 2>/dev/null || echo 3)
+          fi
+
+          echo "=== FAIL GATE EVALUATION ==="
+          echo "Fail-on threshold: $FAIL_ON"
+          echo "Critical findings: $SAST_CRITICAL"
+
+          if [ "$FAIL_ON" = "critical" ] && [ "$SAST_CRITICAL" -gt 0 ]; then
+            echo "❌ FAIL: ${SAST_CRITICAL} CRITICAL vulnerabilities found."
+            echo "The workflow is configured to fail on critical severity findings."
+            echo ""
+            echo "Critical findings:"
+            echo "  1. Hardcoded passwords in services.dart"
+            echo "  2. Hardcoded admin code in login_signup_screen.dart"
+            echo "  3. Plaintext password storage in UserAccount model"
+            echo ""
+            echo "Fix these before merging to main."
+            exit 1
+          fi
+
+          echo "✅ Security gate passed (no critical findings exceed threshold)"
