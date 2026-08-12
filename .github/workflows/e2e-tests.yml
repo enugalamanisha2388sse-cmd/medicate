@@ -86,7 +86,7 @@ jobs:
         with:
           name: medicate-debug-apk
           path: medicate/build/app/outputs/flutter-apk/app-debug.apk
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 3
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: medicate-debug-apk
-          path: medicate/build/app/outputs/flutter-apk/
+          path: ${{ github.workspace }}/medicate/build/app/outputs/flutter-apk/
 
       - name: Enable KVM hardware acceleration
         run: |
@@ -152,7 +152,7 @@ jobs:
             adb shell input keyevent 82
             echo "Emulator ready"
 
-            adb install -r medicate/build/app/outputs/flutter-apk/app-debug.apk
+            adb install -r "$GITHUB_WORKSPACE/medicate/build/app/outputs/flutter-apk/app-debug.apk"
             echo "APK installed"
 
             appium --log ./e2e-tests/logs/appium.log &
